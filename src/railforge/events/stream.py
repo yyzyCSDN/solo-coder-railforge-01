@@ -30,6 +30,13 @@ class CursorPage:
     reset_cursor: int | None = None
 
 
+@dataclass(frozen=True)
+class StreamCheckpoint:
+    events: tuple[StreamEvent, ...]
+    next_sequence: int
+    last_hash: str
+
+
 class CursorExpired(RuntimeError):
     pass
 
@@ -135,4 +142,19 @@ class EventStream:
     def snapshot(self) -> tuple[StreamEvent, ...]:
         with self._lock:
             return tuple(self._events)
+
+    def checkpoint(self) -> StreamCheckpoint:
+        """Capture all state needed to roll back an in-flight transaction."""
+        with self._lock:
+            return StreamCheckpoint(tuple(self._events), self._next_sequence,
+                                    self._last_hash)
+
+    def restore(self, checkpoint: StreamCheckpoint) -> None:
+        """Roll the stream back to a checkpoint; never used on committed data."""
+        with self._lock:
+            self._events = list(checkpoint.events)
+            self._ids = {e.event_id for e in self._events}
+            self._next_sequence = checkpoint.next_sequence
+            self._last_hash = checkpoint.last_hash
+            self._changed.notify_all()
 

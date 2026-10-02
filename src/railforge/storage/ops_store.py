@@ -11,6 +11,11 @@ class VersionedValue:
     value: Any
 
 
+@dataclass(frozen=True)
+class StoreSnapshot:
+    rows: dict[str, VersionedValue]
+
+
 class VersionedStore:
     """Small compare-and-swap store used to make operation publication atomic."""
 
@@ -32,7 +37,11 @@ class VersionedStore:
         with self._lock:
             return self._rows.get(key)
 
-    def snapshot(self) -> dict[str, VersionedValue]:
+    def snapshot(self) -> StoreSnapshot:
         with self._lock:
-            return dict(self._rows)
+            return StoreSnapshot(dict(self._rows))
+
+    def restore(self, snapshot: StoreSnapshot) -> None:
+        with self._lock:
+            self._rows = dict(snapshot.rows)
 

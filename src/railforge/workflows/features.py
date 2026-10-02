@@ -146,3 +146,15 @@ class RailForgeFeatureService:
             return {"accepted": accepted, "delay": fused_delay(observations, max_lateness)}
         return self.control.run(operation_id, "feature.timeline.reconciled", operation_id, at, action)
 
+    def coordinate_cross_bureau_path(self, operation_id, request, sections,
+                                     occupancies=(), guard_minutes=0, at=None):
+        """Cross-bureau freight path coordination with explainable refusals."""
+        return self.control.coordinate_path(operation_id, request, sections,
+                                            occupancies, guard_minutes, at)
+
+    def coordinate_cross_bureau_paths(self, operation_id, requests, sections,
+                                      occupancies=(), guard_minutes=0, at=None):
+        """Priority-ordered batch of cross-bureau freight paths."""
+        return self.control.coordinate_paths(operation_id, requests, sections,
+                                             occupancies, guard_minutes, at)
+

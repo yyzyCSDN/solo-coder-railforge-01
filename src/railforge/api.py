@@ -38,3 +38,19 @@ class RailForgeService:
     def workflow(self):
         return self.control
 
+    def coordinate_freight_path(self, operation_id, request, sections,
+                                occupancies=(), guard_minutes: int = 0, at=None):
+        """Coordinate one cross-bureau freight path atomically.
+
+        Returns an ``OperationReceipt`` whose ``result`` is a domain
+        ``Decision``: an accepted candidate or an explainable rejection.
+        """
+        return self.control.coordinate_path(operation_id, request, sections,
+                                            occupancies, guard_minutes, at)
+
+    def coordinate_freight_paths(self, operation_id, requests, sections,
+                                 occupancies=(), guard_minutes: int = 0, at=None):
+        """Coordinate a priority-ordered batch of cross-bureau paths."""
+        return self.control.coordinate_paths(operation_id, requests, sections,
+                                             occupancies, guard_minutes, at)
+

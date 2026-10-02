@@ -13,10 +13,22 @@ class Record:
     previous_hash: str
     digest: str
 
+
+@dataclass(frozen=True)
+class TrailCheckpoint:
+    rows: tuple[Record, ...]
+
+
 class Trail:
 
     def __init__(self):
         self._rows = []
+
+    def checkpoint(self):
+        return TrailCheckpoint(tuple(self._rows))
+
+    def restore(self, checkpoint):
+        self._rows = list(checkpoint.rows)
 
     @staticmethod
     def _digest(index, actor, action, subject, at, previous):

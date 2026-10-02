@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Mapping, TypeVar
 
 from railforge.audit.trail import Trail
@@ -10,6 +11,16 @@ from railforge.braking.brake_percentage import brake_percentage
 from railforge.billing.demurrage import charge
 from railforge.cargo.segregation import violations
 from railforge.consist.integrity import validate
+from railforge.coordination.paths import (
+    CommitError,
+    CoordinationRequest,
+    Decision,
+    PathLedger,
+    Rejection,
+    STALE_VERSION,
+    batch_coordinate,
+    coordinate,
+)
 from railforge.customs.holds import active
 from railforge.energy.regen import net_energy
 from railforge.eta.event_fusion import fused_delay
@@ -62,12 +73,14 @@ class RailForgeWorkflowControl:
     """Atomic domain -> event -> audit workflow used by every feature surface."""
 
     def __init__(self, stream: EventStream | None = None, trail: Trail | None = None,
-                 store: VersionedStore | None = None):
+                 store: VersionedStore | None = None, ledger: PathLedger | None = None):
         self.stream = stream or EventStream()
         self.trail = trail or Trail()
         self.store = store or VersionedStore()
+        self.path_ledger = ledger or PathLedger()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        self._coordination_lock = RLock()
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
@@ -187,4 +200,288 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
+
+    # ------------------------------------------------------------------
+    # Cross-bureau freight path coordination
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _plan_key(request_id: str) -> str:
+        return f"coordination.plan:{request_id}"
+
+    @staticmethod
+    def _rejection_payload(rejection) -> dict:
+        return {
+            "reason": rejection.reason,
+            "detail": rejection.detail,
+            "sections": list(rejection.sections),
+            "blocking_trains": list(rejection.blocking_trains),
+            "expected_version": rejection.expected_version,
+            "actual_version": rejection.actual_version,
+            "latest_departure": (rejection.latest_departure.isoformat()
+                                 if rejection.latest_departure else None),
+        }
+
+    def coordinate_path(self, operation_id: str, request: CoordinationRequest,
+                        sections, occupancies=(), guard_minutes: int = 0,
+                        at: datetime | None = None):
+        """Atomically coordinate one cross-bureau freight path.
+
+        Accepted request: plan + cursor event + audit row are written as one
+        unit and the shared path ledger gains the occupied sections. Replaying
+        the same ``operation_id`` returns the original receipt and never
+        occupies a section twice.
+
+        Rejected request: no state changes (no ledger bump, no plan row); the
+        returned receipt carries the explainable rejection.
+        """
+        at = at or datetime.now(timezone.utc)
+        with self._coordination_lock:
+            previous = self._receipts.get(operation_id)
+            if previous is not None:
+                if previous.subject != request.train:
+                    raise ValueError("operation id reused for a different workflow")
+                return previous
+
+            if self.path_ledger.contains_request(request.request_id):
+                # Same request under a new operation id: the plan already owns
+                # its sections. Refuse before any write instead of emitting a
+                # misleading rejection or a second occupancy.
+                raise CommitError(
+                    f"request {request.request_id} is already committed; "
+                    "replay the original operation id for an idempotent result"
+                )
+
+            # Optimistic concurrency: a request built on an outdated planning
+            # version is refused with an explainable STALE_VERSION before any
+            # section or block is even examined.
+            current_version = self.path_ledger.version
+            if request.expected_version is not None and request.expected_version != current_version:
+                rejection = Rejection(
+                    request.request_id, request.train, STALE_VERSION, (), (),
+                    (f"planning version {request.expected_version} is stale; "
+                     f"current version is {current_version}; refetch before retrying"),
+                    expected_version=request.expected_version,
+                    actual_version=current_version,
+                )
+                decision = Decision(False, request.request_id, request.train,
+                                    rejection=rejection)
+            else:
+                decision = coordinate(request, sections, occupancies,
+                                      guard_minutes, ledger=self.path_ledger,
+                                      ledger_version=current_version)
+            if not decision.accepted:
+                rejection = decision.rejection
+                payload = {
+                    "operation_id": operation_id,
+                    "status": "rejected",
+                    "control_path": "atomic",
+                    "rejection": self._rejection_payload(rejection),
+                }
+                event = self.stream.publish(
+                    operation_id, at, "coordination.path.rejected",
+                    request.train, payload,
+                )
+                audit = self.trail.append("railforge-control",
+                                          "coordination.path.rejected",
+                                          request.train, at)
+                receipt = OperationReceipt(operation_id,
+                                           "coordination.path.rejected",
+                                           request.train, decision, event,
+                                           audit.index,
+                                           self.path_ledger.version)
+                self._receipts[operation_id] = receipt
+                return receipt
+
+            candidate = decision.candidate
+            # Atomic phase: stage every write, roll all of them back if any
+            # later step fails so a plan can never exist without its sections,
+            # cursor event and audit row.
+            stream_cp = self.stream.checkpoint()
+            trail_cp = self.trail.checkpoint()
+            store_cp = self.store.snapshot()
+            ledger_cp = self.path_ledger.snapshot()
+            try:
+                version = self.path_ledger.add(
+                    candidate,
+                    expected_version=request.expected_version,
+                    guard_minutes=guard_minutes,
+                )
+                plan = _safe(candidate)
+                store_version = self.store.write(self._plan_key(request.request_id),
+                                                 {"status": "committed", "plan": plan,
+                                                  "ledger_version": version})
+                payload = {
+                    "operation_id": operation_id,
+                    "status": "committed",
+                    "control_path": "atomic",
+                    "request_id": request.request_id,
+                    "ledger_version": version,
+                    "version": store_version,
+                    "bureaus": list(candidate.bureaus),
+                    "handoffs": [list(h) for h in candidate.handoffs],
+                    "delay_minutes": candidate.delay_minutes,
+                    "plan": plan,
+                }
+                event = self.stream.publish(
+                    operation_id, at, "coordination.path.committed",
+                    request.train, payload,
+                )
+                audit = self.trail.append("railforge-control",
+                                          "coordination.path.committed",
+                                          request.train, at)
+            except Exception:
+                self.path_ledger.restore(ledger_cp)
+                self.store.restore(store_cp)
+                self.stream.restore(stream_cp)
+                self.trail.restore(trail_cp)
+                raise
+
+            receipt = OperationReceipt(operation_id,
+                                       "coordination.path.committed",
+                                       request.train, decision, event,
+                                       audit.index, version)
+            self._receipts[operation_id] = receipt
+            return receipt
+
+    def coordinate_paths(self, operation_id: str, requests, sections,
+                         occupancies=(), guard_minutes: int = 0,
+                         at: datetime | None = None):
+        """Coordinate a batch of requests priority-first under one operation.
+
+        The whole batch is one transaction: the decisions are computed without
+        touching shared state, then every accepted plan is staged together.
+        Any ledger collision at commit time rolls the entire batch back.
+        """
+        at = at or datetime.now(timezone.utc)
+        with self._coordination_lock:
+            previous = self._receipts.get(operation_id)
+            if previous is not None:
+                return previous
+
+            duplicate = next((r.request_id for r in requests
+                              if self.path_ledger.contains_request(r.request_id)),
+                             None)
+            if duplicate is not None:
+                raise CommitError(
+                    f"request {duplicate} is already committed; "
+                    "replay the original operation id for an idempotent result"
+                )
+
+            current_version = self.path_ledger.version
+            stale = next((r for r in requests
+                          if r.expected_version is not None
+                          and r.expected_version != current_version), None)
+            if stale is not None:
+                rejection = Rejection(
+                    stale.request_id, stale.train, STALE_VERSION, (), (),
+                    (f"planning version {stale.expected_version} is stale; "
+                     f"current version is {current_version}; refetch before retrying"),
+                    expected_version=stale.expected_version,
+                    actual_version=current_version,
+                )
+                event = self.stream.publish(
+                    f"{operation_id}:{stale.request_id}", at,
+                    "coordination.path.rejected", stale.train, {
+                        "operation_id": operation_id,
+                        "request_id": stale.request_id,
+                        "status": "rejected",
+                        "control_path": "atomic",
+                        "rejection": self._rejection_payload(rejection),
+                    },
+                )
+                audit = self.trail.append("railforge-control",
+                                          "coordination.path.rejected",
+                                          stale.train, at)
+                decision = Decision(False, stale.request_id, stale.train,
+                                    rejection=rejection)
+                receipt = OperationReceipt(
+                    operation_id, "coordination.path.rejected", stale.train,
+                    {"decisions": [decision], "accepted": [],
+                     "rejected": [stale.request_id],
+                     "ledger_version": current_version},
+                    event, audit.index, current_version,
+                )
+                self._receipts[operation_id] = receipt
+                return receipt
+
+            scratch = PathLedger()
+            decisions = batch_coordinate(requests, sections, occupancies,
+                                         guard_minutes, ledger=scratch)
+
+            stream_cp = self.stream.checkpoint()
+            trail_cp = self.trail.checkpoint()
+            store_cp = self.store.snapshot()
+            ledger_cp = self.path_ledger.snapshot()
+            try:
+                for decision in decisions:
+                    if not decision.accepted:
+                        rejection = decision.rejection
+                        self.stream.publish(
+                            f"{operation_id}:{decision.request_id}", at,
+                            "coordination.path.rejected", decision.train, {
+                                "operation_id": operation_id,
+                                "request_id": decision.request_id,
+                                "status": "rejected",
+                                "control_path": "atomic",
+                                "rejection": self._rejection_payload(rejection),
+                            },
+                        )
+                        self.trail.append("railforge-control",
+                                          "coordination.path.rejected",
+                                          decision.train, at)
+                        continue
+                    candidate = decision.candidate
+                    version = self.path_ledger.add(
+                        candidate, guard_minutes=guard_minutes)
+                    plan = _safe(candidate)
+                    self.store.write(self._plan_key(candidate.request_id),
+                                     {"status": "committed", "plan": plan,
+                                      "ledger_version": version})
+                    self.stream.publish(
+                        f"{operation_id}:{candidate.request_id}", at,
+                        "coordination.path.committed", candidate.train, {
+                            "operation_id": operation_id,
+                            "request_id": candidate.request_id,
+                            "status": "committed",
+                            "control_path": "atomic",
+                            "ledger_version": version,
+                            "bureaus": list(candidate.bureaus),
+                            "handoffs": [list(h) for h in candidate.handoffs],
+                            "delay_minutes": candidate.delay_minutes,
+                            "plan": plan,
+                        },
+                    )
+                    self.trail.append("railforge-control",
+                                      "coordination.path.committed",
+                                      candidate.train, at)
+
+                result = {"decisions": decisions,
+                          "accepted": [d.request_id for d in decisions if d.accepted],
+                          "rejected": [d.request_id for d in decisions if not d.accepted],
+                          "ledger_version": self.path_ledger.version}
+                summary_event = self.stream.publish(
+                    operation_id, at, "coordination.batch.committed", operation_id,
+                    {"operation_id": operation_id, "status": "committed",
+                     "control_path": "atomic",
+                     "accepted": result["accepted"], "rejected": result["rejected"],
+                     "ledger_version": result["ledger_version"]},
+                )
+                summary_audit = self.trail.append("railforge-control",
+                                                  "coordination.batch.committed",
+                                                  operation_id, at)
+            except Exception:
+                self.path_ledger.restore(ledger_cp)
+                self.store.restore(store_cp)
+                self.stream.restore(stream_cp)
+                self.trail.restore(trail_cp)
+                raise
+
+            receipt = OperationReceipt(operation_id,
+                                       "coordination.batch.committed",
+                                       operation_id, result, summary_event,
+                                       summary_audit.index,
+                                       self.path_ledger.version)
+            self._receipts[operation_id] = receipt
+            return receipt
 
