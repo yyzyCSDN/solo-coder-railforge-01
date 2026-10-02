@@ -91,6 +91,19 @@ class EventStream:
         with self._lock:
             return self._events[-1].sequence if self._events else 0
 
+    def retract(self, sequence: int) -> bool:
+        """Remove the most recent event so a failed atomic commit leaves no trace.
+
+        Only the tail may be retracted, which keeps the hash chain intact."""
+        with self._lock:
+            if not self._events or self._events[-1].sequence != sequence:
+                return False
+            old = self._events.pop()
+            self._ids.discard(old.event_id)
+            self._next_sequence = old.sequence
+            self._last_hash = old.previous_hash
+            return True
+
     @property
     def floor(self) -> int:
         with self._lock:

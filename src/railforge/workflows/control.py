@@ -19,6 +19,16 @@ from railforge.intermodal.connections import feasible
 from railforge.inventory.wagon_pool import allocate
 from railforge.locomotive.tractive_effort import available_effort
 from railforge.maintenance.release import releasable
+from railforge.planning.cross_bureau_paths import (
+    CandidatePath,
+    CorridorState,
+    Occupancy as PathOccupancy,
+    PathOutcome,
+    Rejection,
+    STALE_VERSION,
+    evaluate as evaluate_path,
+    request_order,
+)
 from railforge.possession.windows import conflicts as possession_conflicts
 from railforge.routing.clearance import route_ok
 from railforge.signaling.block_occupancy import reserve
@@ -187,4 +197,117 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
+
+    # --- Cross-bureau freight path coordination -------------------------------
+
+    @staticmethod
+    def _corridor_key(corridor_id: str) -> str:
+        return f"cross-bureau-corridor:{corridor_id}"
+
+    def _commit_path_outcome(self, operation_id, topic, subject, request, outcome,
+                             writes, at, evidence=None):
+        """Atomically apply corridor plan writes, then publish the cursor event and the
+        audit record. Any failure rolls the earlier steps back so no partial commit and
+        no phantom section occupation is left behind."""
+        priors = {}
+        for key, _, _ in writes:
+            priors[key] = self.store.read(key)
+        event = None
+        audit = None
+        try:
+            version = outcome.version
+            for key, value, expected in writes:
+                version = self.store.write(key, value, expected_version=expected)
+            payload = {
+                "operation_id": operation_id,
+                "status": "committed",
+                "control_path": "atomic",
+                "corridor": subject,
+                "request_id": request.request_id,
+                "decision": outcome.decision,
+                "version": version,
+                "result": _safe(outcome),
+            }
+            if evidence:
+                payload.update(dict(evidence))
+            event = self.stream.publish(operation_id, at, topic, subject, payload)
+            audit = self.trail.append("railforge-control", topic, subject, at)
+        except Exception:
+            if audit is not None:
+                self.trail.retract(audit.index)
+            if event is not None:
+                self.stream.retract(event.sequence)
+            for key, _, _ in reversed(writes):
+                self.store.restore(key, priors[key])
+            raise
+        receipt = OperationReceipt(operation_id, topic, subject, outcome, event,
+                                   audit.index, version)
+        self._receipts[operation_id] = receipt
+        return receipt
+
+    def commit_cross_bureau_path(self, operation_id, corridor_id, request, sections,
+                                 occupied, headway_minutes, at, evidence=None):
+        """Coordinate one cross-bureau freight path request.
+
+        Generates a candidate from the customer window, section capacity, block
+        occupancy and priority, then atomically commits plan + cursor event + audit.
+        Replaying the same operation or the same request_id never re-occupies a
+        section. Single-track meets and stale corridor versions produce explainable
+        rejections that are themselves committed to the event and audit log."""
+        topic = "path.cross_bureau.coordinated"
+        subject = corridor_id
+        previous = self._receipts.get(operation_id)
+        if previous is not None:
+            if previous.topic != topic or previous.subject != subject:
+                raise ValueError("operation id reused for a different workflow")
+            return previous
+        key = self._corridor_key(corridor_id)
+        row = self.store.read(key)
+        state = row.value if row is not None else CorridorState(corridor_id)
+        version = row.version if row is not None else 0
+        decided = dict(state.decisions)
+        if request.request_id in decided:
+            original = self._receipts.get(decided[request.request_id])
+            if original is not None:
+                return original
+            # Defensive: corridor state outlived the in-memory receipts. Never
+            # re-occupy; report the already-committed slots instead.
+            slots = tuple(s for s in state.slots if s.request_id == request.request_id)
+            result = {"status": "replayed", "request_id": request.request_id, "slots": slots}
+            return OperationReceipt(operation_id, topic, subject, result, None, 0, version)
+        if request.expected_version is not None and request.expected_version != version:
+            rejection = Rejection(
+                request.request_id, STALE_VERSION,
+                f"stale corridor version: expected {request.expected_version}, "
+                f"current {version}; reload the corridor plan and retry")
+            outcome = PathOutcome.rejected(rejection, version)
+            return self._commit_path_outcome(operation_id, topic, subject, request,
+                                             outcome, (), at, evidence)
+        busy = [PathOccupancy(s.train, s.section, s.start, s.end, s.direction)
+                for s in state.slots]
+        busy.extend(occupied)
+        result = evaluate_path(request, sections, busy, headway_minutes)
+        if isinstance(result, CandidatePath):
+            new_state = CorridorState(
+                corridor_id,
+                state.slots + result.slots,
+                state.decisions + ((request.request_id, operation_id),))
+            outcome = PathOutcome.accepted(result, version + 1)
+            writes = ((key, new_state, version),)
+        else:
+            outcome = PathOutcome.rejected(result, version)
+            writes = ()
+        return self._commit_path_outcome(operation_id, topic, subject, request,
+                                         outcome, writes, at, evidence)
+
+    def commit_cross_bureau_batch(self, operation_id, corridor_id, requests, sections,
+                                  occupied, headway_minutes, at, evidence=None):
+        """Commit many competing requests in priority order, each atomically, so a
+        higher-priority train's slots are visible to the requests planned after it."""
+        receipts = {}
+        for req in request_order(requests):
+            receipts[req.request_id] = self.commit_cross_bureau_path(
+                f"{operation_id}:{req.request_id}", corridor_id, req, sections, occupied,
+                headway_minutes, at, evidence)
+        return receipts
 

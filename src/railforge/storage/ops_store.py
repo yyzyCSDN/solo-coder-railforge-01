@@ -32,6 +32,16 @@ class VersionedStore:
         with self._lock:
             return self._rows.get(key)
 
+    def restore(self, key: str, row: VersionedValue | None) -> None:
+        """Restore a previous read() snapshot, or remove the key when row is None.
+
+        Used to roll back the store side of a failed atomic commit."""
+        with self._lock:
+            if row is None:
+                self._rows.pop(key, None)
+            else:
+                self._rows[key] = row
+
     def snapshot(self) -> dict[str, VersionedValue]:
         with self._lock:
             return dict(self._rows)

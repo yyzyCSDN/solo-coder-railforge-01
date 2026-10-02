@@ -32,6 +32,18 @@ class Trail:
         self._rows.append(r)
         return r
 
+    def __len__(self):
+        return len(self._rows)
+
+    def retract(self, index):
+        """Remove the most recent record so a failed atomic commit leaves no trace.
+
+        Only the tail may be retracted, which keeps the hash chain intact."""
+        if self._rows and self._rows[-1].index == index:
+            self._rows.pop()
+            return True
+        return False
+
     def verify(self):
         prev = 'GENESIS'
         for r in self._rows:
